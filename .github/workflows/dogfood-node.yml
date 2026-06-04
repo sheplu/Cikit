@@ -1,0 +1,52 @@
+name: Dogfood Node.js reusable workflows
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/node-ci.yml
+      - .github/workflows/npm-publish.yml
+      - .github/workflows/dependency-guard.yml
+      - .github/workflows/dogfood-node.yml
+      - fixtures/node-basic/**
+      - README.md
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  node-ci:
+    name: Node.js CI fixture
+    uses: ./.github/workflows/node-ci.yml
+    with:
+      node-version: 24.x
+      working-directory: fixtures/node-basic
+      package-manager: npm
+      scripts: lint,typecheck,test,build
+      skip-missing-scripts: false
+
+  dependency-guard:
+    name: Dependency guard fixture
+    uses: ./.github/workflows/dependency-guard.yml
+    with:
+      node-version: 24.x
+      working-directory: fixtures/node-basic
+      package-json: package.json
+      prod: true
+      dev: true
+      peer: true
+      optional: true
+
+  npm-publish-dry-run:
+    name: npm publish dry-run fixture
+    uses: ./.github/workflows/npm-publish.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      node-version: 24.x
+      working-directory: fixtures/node-basic
+      package-manager: npm
+      quality-scripts: lint,typecheck,test,build
+      skip-missing-scripts: false
+      dry-run: true

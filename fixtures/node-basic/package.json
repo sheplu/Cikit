@@ -1,0 +1,23 @@
+{
+  "name": "@sheplu/cikit-node-fixture",
+  "version": "0.0.0",
+  "description": "Fixture used to dogfood Cikit reusable Node.js workflows.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "lint": "node scripts/lint.js",
+    "typecheck": "node scripts/typecheck.js",
+    "test": "node --test 'test/**/*.test.js'",
+    "build": "node scripts/build.js",
+    "prepublishOnly": "node scripts/build.js"
+  },
+  "files": [
+    "dist"
+  ]
+}

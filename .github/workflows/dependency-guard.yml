@@ -1,0 +1,262 @@
+name: Reusable dependency guard
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version used to run @sheplu/dependency-guard.
+        required: false
+        type: string
+        default: 24.x
+      working-directory:
+        description: Directory containing the package.json to inspect.
+        required: false
+        type: string
+        default: .
+      package-json:
+        description: Path to package.json relative to working-directory.
+        required: false
+        type: string
+        default: package.json
+      dependency-guard-version:
+        description: Version or dist-tag of @sheplu/dependency-guard to run.
+        required: false
+        type: string
+        default: latest
+      registry-url:
+        description: Registry URL passed to dependency-guard.
+        required: false
+        type: string
+        default: https://registry.npmjs.org
+      fail-on:
+        description: Optional dependency-guard --fail-on value.
+        required: false
+        type: string
+        default: ''
+      max-age:
+        description: Optional dependency-guard --max-age value in days.
+        required: false
+        type: string
+        default: ''
+      prod:
+        description: Check production dependencies.
+        required: false
+        type: boolean
+        default: true
+      dev:
+        description: Check dev dependencies.
+        required: false
+        type: boolean
+        default: true
+      peer:
+        description: Check peer dependencies.
+        required: false
+        type: boolean
+        default: true
+      optional:
+        description: Check optional dependencies.
+        required: false
+        type: boolean
+        default: true
+      ignore-scopes:
+        description: Comma- or newline-separated scopes to ignore, such as @internal.
+        required: false
+        type: string
+        default: ''
+      only:
+        description: Comma- or newline-separated package names to check.
+        required: false
+        type: string
+        default: ''
+      no-cache:
+        description: Disable dependency-guard registry cache.
+        required: false
+        type: boolean
+        default: false
+      checkout-ref:
+        description: Optional Git ref to checkout. Defaults to the workflow event ref.
+        required: false
+        type: string
+        default: ''
+    outputs:
+      total:
+        description: Total dependencies reported by dependency-guard.
+        value: ${{ jobs.dependency_guard.outputs.total }}
+      up-to-date:
+        description: Dependencies reported as up to date.
+        value: ${{ jobs.dependency_guard.outputs.up_to_date }}
+      minor-updates:
+        description: Dependencies with minor updates.
+        value: ${{ jobs.dependency_guard.outputs.minor_updates }}
+      major-updates:
+        description: Dependencies with major updates.
+        value: ${{ jobs.dependency_guard.outputs.major_updates }}
+
+permissions:
+  contents: read
+
+jobs:
+  dependency_guard:
+    name: Dependency guard
+    runs-on: ubuntu-latest
+    outputs:
+      total: ${{ steps.summary.outputs.total }}
+      up_to_date: ${{ steps.summary.outputs.up_to_date }}
+      minor_updates: ${{ steps.summary.outputs.minor_updates }}
+      major_updates: ${{ steps.summary.outputs.major_updates }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.checkout-ref || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Run dependency guard
+        id: guard
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PACKAGE_JSON: ${{ inputs.package-json }}
+          DEPENDENCY_GUARD_VERSION: ${{ inputs.dependency-guard-version }}
+          REGISTRY_URL: ${{ inputs.registry-url }}
+          FAIL_ON: ${{ inputs.fail-on }}
+          MAX_AGE: ${{ inputs.max-age }}
+          CHECK_PROD: ${{ inputs.prod }}
+          CHECK_DEV: ${{ inputs.dev }}
+          CHECK_PEER: ${{ inputs.peer }}
+          CHECK_OPTIONAL: ${{ inputs.optional }}
+          IGNORE_SCOPES: ${{ inputs.ignore-scopes }}
+          ONLY_PACKAGES: ${{ inputs.only }}
+          NO_CACHE: ${{ inputs.no-cache }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "${PACKAGE_JSON}" ]; then
+            echo "::error::Package manifest '${PACKAGE_JSON}' not found in ${PWD}."
+            exit 1
+          fi
+
+          case "${DEPENDENCY_GUARD_VERSION}" in
+            ''|*[!A-Za-z0-9._@+-]*)
+              echo "::error::Invalid dependency-guard version '${DEPENDENCY_GUARD_VERSION}'."
+              exit 1
+              ;;
+          esac
+
+          args=(--path "${PACKAGE_JSON}" --format json --registry "${REGISTRY_URL}")
+
+          [ "${CHECK_PROD}" = "true" ] && args+=(--prod)
+          [ "${CHECK_DEV}" = "true" ] && args+=(--dev)
+          [ "${CHECK_PEER}" = "true" ] && args+=(--peer)
+          [ "${CHECK_OPTIONAL}" = "true" ] && args+=(--optional)
+
+          if [ -n "${FAIL_ON}" ]; then
+            case "${FAIL_ON}" in
+              *[!A-Za-z0-9._-]*)
+                echo "::error::Invalid fail-on value '${FAIL_ON}'."
+                exit 1
+                ;;
+            esac
+            args+=(--fail-on "${FAIL_ON}")
+          fi
+
+          if [ -n "${MAX_AGE}" ]; then
+            case "${MAX_AGE}" in
+              *[!0-9]*)
+                echo "::error::max-age must be a number of days."
+                exit 1
+                ;;
+            esac
+            args+=(--max-age "${MAX_AGE}")
+          fi
+
+          if [ "${NO_CACHE}" = "true" ]; then
+            args+=(--no-cache)
+          fi
+
+          add_list_args() {
+            local flag="$1"
+            local values="$2"
+            local item
+            while IFS= read -r item; do
+              item="${item#"${item%%[![:space:]]*}"}"
+              item="${item%"${item##*[![:space:]]}"}"
+              [ -z "${item}" ] && continue
+              case "${item}" in
+                *[!A-Za-z0-9@._/-]*)
+                  echo "::error::Invalid value '${item}' for ${flag}."
+                  exit 1
+                  ;;
+              esac
+              args+=("${flag}" "${item}")
+            done < <(printf '%s\n' "${values}" | tr ',' '\n')
+          }
+
+          add_list_args --ignore-scope "${IGNORE_SCOPES}"
+          add_list_args --only "${ONLY_PACKAGES}"
+
+          set +e
+          npx --yes "@sheplu/dependency-guard@${DEPENDENCY_GUARD_VERSION}" "${args[@]}" > "${RUNNER_TEMP}/dependency-guard.json"
+          exit_code="$?"
+          set -e
+
+          {
+            echo "json_path=${RUNNER_TEMP}/dependency-guard.json"
+            echo "exit_code=${exit_code}"
+          } >> "${GITHUB_OUTPUT}"
+
+          if [ "${exit_code}" -ne 0 ]; then
+            if ! node -e "JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8'))" "${RUNNER_TEMP}/dependency-guard.json"; then
+              exit "${exit_code}"
+            fi
+          fi
+
+      - name: Write dependency guard summary
+        id: summary
+        env:
+          DEPENDENCY_GUARD_JSON: ${{ steps.guard.outputs.json_path }}
+          DEPENDENCY_GUARD_EXIT_CODE: ${{ steps.guard.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const data = JSON.parse(fs.readFileSync(process.env.DEPENDENCY_GUARD_JSON, 'utf8'));
+          const summary = data.summary || {};
+          const dependencies = Array.isArray(data.dependencies) ? data.dependencies : [];
+          const rows = dependencies.map((dependency) => {
+            const updateType = dependency.updateType || 'unknown';
+            const current = dependency.current?.version || '-';
+            const latestMinor = dependency.latestMinor?.version || '-';
+            const latestMajor = dependency.latestMajor?.version || '-';
+            const age = typeof dependency.ageInDays === 'number' ? `${dependency.ageInDays}d` : '-';
+            return `| ${dependency.name || '-'} | ${dependency.type || '-'} | ${current} | ${latestMinor} | ${latestMajor} | ${age} | ${updateType} |`;
+          });
+
+          const markdown = [
+            '## Dependency guard',
+            '',
+            `- Total: ${summary.total ?? dependencies.length}`,
+            `- Up to date: ${summary.upToDate ?? 0}`,
+            `- Minor updates: ${summary.minorUpdates ?? 0}`,
+            `- Major updates: ${summary.majorUpdates ?? 0}`,
+            '',
+            '| Package | Type | Current | Latest minor | Latest major | Age | Status |',
+            '| --- | --- | --- | --- | --- | --- | --- |',
+            ...(rows.length > 0 ? rows : ['| _No dependencies reported_ | - | - | - | - | - | - |']),
+            '',
+          ].join('\n');
+
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, markdown);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, [
+            `total=${summary.total ?? dependencies.length}`,
+            `up_to_date=${summary.upToDate ?? 0}`,
+            `minor_updates=${summary.minorUpdates ?? 0}`,
+            `major_updates=${summary.majorUpdates ?? 0}`,
+            '',
+          ].join('\n'));
+          NODE
+          exit "${DEPENDENCY_GUARD_EXIT_CODE}"

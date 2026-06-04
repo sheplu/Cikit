@@ -1,0 +1,260 @@
+name: Reusable Node.js CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version passed to actions/setup-node.
+        required: false
+        type: string
+        default: 24.x
+      working-directory:
+        description: Directory containing package.json.
+        required: false
+        type: string
+        default: .
+      package-manager:
+        description: Package manager to use. Set to auto, npm, pnpm, or yarn.
+        required: false
+        type: string
+        default: auto
+      install:
+        description: Install dependencies before running scripts.
+        required: false
+        type: boolean
+        default: true
+      cache:
+        description: Enable setup-node dependency caching when a lockfile is present.
+        required: false
+        type: boolean
+        default: true
+      scripts:
+        description: Comma- or newline-separated package scripts to run in order.
+        required: false
+        type: string
+        default: lint,typecheck,test,build
+      skip-missing-scripts:
+        description: Skip requested scripts that are not defined in package.json.
+        required: false
+        type: boolean
+        default: true
+      checkout-ref:
+        description: Optional Git ref to checkout. Defaults to the workflow event ref.
+        required: false
+        type: string
+        default: ''
+    outputs:
+      package-manager:
+        description: Detected or selected package manager.
+        value: ${{ jobs.node_ci.outputs.package_manager }}
+      scripts-run:
+        description: Comma-separated list of package scripts that ran.
+        value: ${{ jobs.node_ci.outputs.scripts_run }}
+
+permissions:
+  contents: read
+
+jobs:
+  node_ci:
+    name: Node.js CI
+    runs-on: ubuntu-latest
+    outputs:
+      package_manager: ${{ steps.detect.outputs.package_manager }}
+      scripts_run: ${{ steps.run-scripts.outputs.ran }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.checkout-ref || github.ref }}
+
+      - name: Detect package manager
+        id: detect
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          REQUESTED_PACKAGE_MANAGER: ${{ inputs.package-manager }}
+          CACHE_ENABLED: ${{ inputs.cache }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f package.json ]; then
+            echo "::error::package.json not found in ${PWD}."
+            exit 1
+          fi
+
+          requested="${REQUESTED_PACKAGE_MANAGER}"
+          package_manager_field="$(node <<'NODE'
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const packageManager = typeof pkg.packageManager === 'string'
+          ? pkg.packageManager
+          : '';
+          console.log(packageManager.includes('@')
+          ? packageManager.slice(0, packageManager.lastIndexOf('@'))
+          : packageManager);
+          NODE
+          )"
+
+          case "${requested}" in
+            auto|'')
+              if [ -n "${package_manager_field}" ]; then
+                manager="${package_manager_field}"
+              elif [ -f pnpm-lock.yaml ]; then
+                manager="pnpm"
+              elif [ -f yarn.lock ]; then
+                manager="yarn"
+              else
+                manager="npm"
+              fi
+              ;;
+            npm|pnpm|yarn)
+              manager="${requested}"
+              ;;
+            *)
+              echo "::error::Unsupported package manager '${requested}'. Use auto, npm, pnpm, or yarn."
+              exit 1
+              ;;
+          esac
+
+          case "${manager}" in
+            npm)
+              lockfile=""
+              [ -f package-lock.json ] && lockfile="package-lock.json"
+              [ -f npm-shrinkwrap.json ] && lockfile="npm-shrinkwrap.json"
+              ;;
+            pnpm)
+              lockfile=""
+              [ -f pnpm-lock.yaml ] && lockfile="pnpm-lock.yaml"
+              ;;
+            yarn)
+              lockfile=""
+              [ -f yarn.lock ] && lockfile="yarn.lock"
+              ;;
+            *)
+              echo "::error::Unsupported package manager '${manager}' from package.json packageManager field."
+              exit 1
+              ;;
+          esac
+
+          cache_manager=""
+          if [ "${CACHE_ENABLED}" = "true" ] && [ -n "${lockfile}" ]; then
+            cache_manager="${manager}"
+          fi
+
+          {
+            echo "package_manager=${manager}"
+            echo "lockfile=${lockfile}"
+            echo "cache_manager=${cache_manager}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Node.js with dependency cache
+        if: steps.detect.outputs.cache_manager != ''
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ steps.detect.outputs.cache_manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ steps.detect.outputs.lockfile }}
+
+      - name: Setup Node.js
+        if: steps.detect.outputs.cache_manager == ''
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install dependencies
+        if: inputs.install
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PACKAGE_MANAGER: ${{ steps.detect.outputs.package_manager }}
+        run: |
+          set -euo pipefail
+          if [ "${PACKAGE_MANAGER}" = "pnpm" ] || [ "${PACKAGE_MANAGER}" = "yarn" ]; then
+            if ! command -v "${PACKAGE_MANAGER}" >/dev/null 2>&1; then
+              corepack enable
+            fi
+          fi
+
+          case "${PACKAGE_MANAGER}" in
+            npm)
+              if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+                npm ci
+              else
+                npm install
+              fi
+              ;;
+            pnpm)
+              if [ -f pnpm-lock.yaml ]; then
+                pnpm install --frozen-lockfile
+              else
+                pnpm install
+              fi
+              ;;
+            yarn)
+              if yarn --version | grep -q '^1\.'; then
+                if [ -f yarn.lock ]; then
+                  yarn install --frozen-lockfile
+                else
+                  yarn install
+                fi
+              elif [ -f yarn.lock ]; then
+                yarn install --immutable
+              else
+                yarn install
+              fi
+              ;;
+          esac
+
+      - name: Run requested package scripts
+        id: run-scripts
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PACKAGE_MANAGER: ${{ steps.detect.outputs.package_manager }}
+          REQUESTED_SCRIPTS: ${{ inputs.scripts }}
+          SKIP_MISSING_SCRIPTS: ${{ inputs.skip-missing-scripts }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { spawnSync } = require('node:child_process');
+
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const requested = (process.env.REQUESTED_SCRIPTS || '')
+            .split(/[\n,]/)
+            .map((script) => script.trim())
+            .filter(Boolean);
+          const skipMissing = process.env.SKIP_MISSING_SCRIPTS === 'true';
+          const packageManager = process.env.PACKAGE_MANAGER || 'npm';
+          const definedScripts = pkg.scripts || {};
+          const missing = [];
+          const ran = [];
+
+          for (const script of requested) {
+            if (!Object.hasOwn(definedScripts, script)) {
+              missing.push(script);
+              continue;
+            }
+
+            const command = packageManager;
+            const args = packageManager === 'npm' ? ['run', script] : ['run', script];
+            console.log(`::group::${packageManager} run ${script}`);
+            const result = spawnSync(command, args, { stdio: 'inherit', shell: false });
+            console.log('::endgroup::');
+
+            if (result.status !== 0) {
+              process.exit(result.status || 1);
+            }
+            ran.push(script);
+          }
+
+          if (missing.length > 0) {
+            const message = `Missing package scripts: ${missing.join(', ')}`;
+            if (skipMissing) {
+              console.log(`::notice::${message}`);
+            } else {
+              console.error(`::error::${message}`);
+              process.exit(1);
+            }
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `ran=${ran.join(',')}\n`);
+          NODE

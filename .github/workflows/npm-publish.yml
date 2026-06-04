@@ -1,0 +1,310 @@
+name: Reusable npm publish
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version passed to actions/setup-node.
+        required: false
+        type: string
+        default: 24.x
+      working-directory:
+        description: Directory containing the package.json to publish.
+        required: false
+        type: string
+        default: .
+      package-manager:
+        description: Package manager to use for install and quality scripts. Set to auto, npm, pnpm, or yarn.
+        required: false
+        type: string
+        default: auto
+      install:
+        description: Install dependencies before quality scripts and publish.
+        required: false
+        type: boolean
+        default: true
+      quality-scripts:
+        description: Comma- or newline-separated scripts to run before publishing.
+        required: false
+        type: string
+        default: lint,typecheck,test,build
+      skip-missing-scripts:
+        description: Skip quality scripts that are not defined in package.json.
+        required: false
+        type: boolean
+        default: true
+      registry-url:
+        description: npm-compatible registry URL.
+        required: false
+        type: string
+        default: https://registry.npmjs.org
+      tag:
+        description: npm dist-tag to publish.
+        required: false
+        type: string
+        default: latest
+      access:
+        description: npm package access. Use public for public scoped packages, restricted for private scopes, or empty to omit.
+        required: false
+        type: string
+        default: public
+      provenance:
+        description: Add npm provenance attestation for real publishes.
+        required: false
+        type: boolean
+        default: true
+      dry-run:
+        description: Run npm publish --dry-run instead of publishing.
+        required: false
+        type: boolean
+        default: false
+      checkout-ref:
+        description: Optional Git ref to checkout. Defaults to the workflow event ref.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      npm-token:
+        description: Optional npm automation token. Prefer npm trusted publishing with id-token permissions when available.
+        required: false
+    outputs:
+      package-name:
+        description: Name read from package.json.
+        value: ${{ jobs.publish.outputs.package_name }}
+      package-version:
+        description: Version read from package.json.
+        value: ${{ jobs.publish.outputs.package_version }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: npm publish
+    runs-on: ubuntu-latest
+    outputs:
+      package_name: ${{ steps.package.outputs.name }}
+      package_version: ${{ steps.package.outputs.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.checkout-ref || github.ref }}
+
+      - name: Detect package manager
+        id: detect
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          REQUESTED_PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f package.json ]; then
+            echo "::error::package.json not found in ${PWD}."
+            exit 1
+          fi
+
+          requested="${REQUESTED_PACKAGE_MANAGER}"
+          package_manager_field="$(node <<'NODE'
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const packageManager = typeof pkg.packageManager === 'string'
+          ? pkg.packageManager
+          : '';
+          console.log(packageManager.includes('@')
+          ? packageManager.slice(0, packageManager.lastIndexOf('@'))
+          : packageManager);
+          NODE
+          )"
+
+          case "${requested}" in
+            auto|'')
+              if [ -n "${package_manager_field}" ]; then
+                manager="${package_manager_field}"
+              elif [ -f pnpm-lock.yaml ]; then
+                manager="pnpm"
+              elif [ -f yarn.lock ]; then
+                manager="yarn"
+              else
+                manager="npm"
+              fi
+              ;;
+            npm|pnpm|yarn)
+              manager="${requested}"
+              ;;
+            *)
+              echo "::error::Unsupported package manager '${requested}'. Use auto, npm, pnpm, or yarn."
+              exit 1
+              ;;
+          esac
+
+          case "${manager}" in
+            npm|pnpm|yarn) ;;
+            *)
+              echo "::error::Unsupported package manager '${manager}' from package.json packageManager field."
+              exit 1
+              ;;
+          esac
+
+          echo "package_manager=${manager}" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: ${{ inputs.registry-url }}
+
+      - name: Install dependencies
+        if: inputs.install
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PACKAGE_MANAGER: ${{ steps.detect.outputs.package_manager }}
+        run: |
+          set -euo pipefail
+          if [ "${PACKAGE_MANAGER}" = "pnpm" ] || [ "${PACKAGE_MANAGER}" = "yarn" ]; then
+            if ! command -v "${PACKAGE_MANAGER}" >/dev/null 2>&1; then
+              corepack enable
+            fi
+          fi
+
+          case "${PACKAGE_MANAGER}" in
+            npm)
+              if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+                npm ci
+              else
+                npm install
+              fi
+              ;;
+            pnpm)
+              if [ -f pnpm-lock.yaml ]; then
+                pnpm install --frozen-lockfile
+              else
+                pnpm install
+              fi
+              ;;
+            yarn)
+              if yarn --version | grep -q '^1\.'; then
+                if [ -f yarn.lock ]; then
+                  yarn install --frozen-lockfile
+                else
+                  yarn install
+                fi
+              elif [ -f yarn.lock ]; then
+                yarn install --immutable
+              else
+                yarn install
+              fi
+              ;;
+          esac
+
+      - name: Run quality scripts
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PACKAGE_MANAGER: ${{ steps.detect.outputs.package_manager }}
+          REQUESTED_SCRIPTS: ${{ inputs.quality-scripts }}
+          SKIP_MISSING_SCRIPTS: ${{ inputs.skip-missing-scripts }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { spawnSync } = require('node:child_process');
+
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const requested = (process.env.REQUESTED_SCRIPTS || '')
+            .split(/[\n,]/)
+            .map((script) => script.trim())
+            .filter(Boolean);
+          const skipMissing = process.env.SKIP_MISSING_SCRIPTS === 'true';
+          const packageManager = process.env.PACKAGE_MANAGER || 'npm';
+          const definedScripts = pkg.scripts || {};
+          const missing = [];
+
+          for (const script of requested) {
+            if (!Object.hasOwn(definedScripts, script)) {
+              missing.push(script);
+              continue;
+            }
+
+            console.log(`::group::${packageManager} run ${script}`);
+            const result = spawnSync(packageManager, ['run', script], { stdio: 'inherit', shell: false });
+            console.log('::endgroup::');
+
+            if (result.status !== 0) {
+              process.exit(result.status || 1);
+            }
+          }
+
+          if (missing.length > 0) {
+            const message = `Missing package scripts: ${missing.join(', ')}`;
+            if (skipMissing) {
+              console.log(`::notice::${message}`);
+            } else {
+              console.error(`::error::${message}`);
+              process.exit(1);
+            }
+          }
+          NODE
+
+      - name: Read package metadata
+        id: package
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          if (!pkg.name || !pkg.version) {
+            console.error('::error::package.json must define name and version before publish.');
+            process.exit(1);
+          }
+          if (pkg.private === true && process.env.DRY_RUN !== 'true') {
+            console.error('::error::Refusing to publish a package with private: true.');
+            process.exit(1);
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `name=${pkg.name}\nversion=${pkg.version}\n`);
+          NODE
+        env:
+          DRY_RUN: ${{ inputs.dry-run }}
+
+      - name: Publish package
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets['npm-token'] }}
+          NPM_CONFIG_REGISTRY: ${{ inputs.registry-url }}
+          NPM_TAG: ${{ inputs.tag }}
+          NPM_ACCESS: ${{ inputs.access }}
+          NPM_PROVENANCE: ${{ inputs.provenance }}
+          NPM_DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+
+          case "${NPM_TAG}" in
+            ''|*[!A-Za-z0-9._-]*)
+              echo "::error::Invalid npm dist-tag '${NPM_TAG}'."
+              exit 1
+              ;;
+          esac
+
+          args=(publish --tag "${NPM_TAG}")
+
+          if [ -n "${NPM_ACCESS}" ]; then
+            case "${NPM_ACCESS}" in
+              public|restricted) args+=(--access "${NPM_ACCESS}") ;;
+              *)
+                echo "::error::Invalid npm access '${NPM_ACCESS}'. Use public, restricted, or empty."
+                exit 1
+                ;;
+            esac
+          fi
+
+          if [ "${NPM_PROVENANCE}" = "true" ] && [ "${NPM_DRY_RUN}" != "true" ]; then
+            args+=(--provenance)
+          fi
+
+          if [ "${NPM_DRY_RUN}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+
+          npm "${args[@]}"
